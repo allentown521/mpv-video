@@ -1,0 +1,19 @@
+apply plugin: 'com.android.library'
+
+apply from: "../common.gradle"
+//apply from: "../playFlavor.gradle"
+android {
+
+    defaultConfig {
+        namespace "is.xyz.mpv"
+    }
+}
+
+dependencies {
+    implementation project(':focus-common')
+    implementation "androidx.appcompat:appcompat:$appcompatVersion"
+    implementation "com.google.android.material:material:$googleMaterialVersion"
+    implementation "androidx.preference:preference-ktx:$preferenceVersion"
+    implementation 'androidx.media:media:1.6.0'
+
+}
