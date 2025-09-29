@@ -92,8 +92,8 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         override fun onProgressChanged(seekBar: SeekBar, progress: Int, fromUser: Boolean) {
             if (!fromUser)
                 return
-            player.timePos = progress
-            updatePlaybackPos(progress)
+            player.timePos = progress.toDouble() / SEEK_BAR_PRECISION
+            // Note: don't call updatePlaybackPos() here either
         }
 
         override fun onStartTrackingTouch(seekBar: SeekBar) {
@@ -534,7 +534,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
             val oldValue = MPVLib.getPropertyString("keep-open")
             MPVLib.setPropertyBoolean("keep-open", true)
             return {
-                MPVLib.setPropertyString("keep-open", oldValue)
+                oldValue?.also { MPVLib.setPropertyString("keep-open", it) }
             }
         }
 
@@ -901,6 +901,27 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         return filepath
     }
 
+    private fun translateContentUri(uri: Uri): String {
+        val resolver = requireActivity().applicationContext.contentResolver
+        Log.v(TAG, "Resolving content URI: $uri")
+        try {
+            resolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                // See if we can skip the indirection and read the real file directly
+                val path = Utils.findRealPath(pfd.fd)
+                if (path != null) {
+                    Log.v(TAG, "Found real file path: $path")
+                    return path
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open content fd: $e")
+        }
+
+        // Otherwise, just let mpv open the content URI directly via ffmpeg
+        return uri.toString()
+    }
+
+
     private fun openContentFd(uri: Uri): String? {
         val resolver = requireActivity().applicationContext.contentResolver
         Log.v(TAG, "Resolving content URI: $uri")
@@ -1117,9 +1138,10 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
             if (result != Activity.RESULT_OK)
                 return
             // file picker may return a content URI or a bare file path
+            // file picker may return a content URI or a bare file path
             val path = data!!.getStringExtra("path")!!
             val path2 = if (path.startsWith("content://"))
-                openContentFd(Uri.parse(path))
+                translateContentUri(Uri.parse(path))
             else
                 path
             MPVLib.command(arrayOf(cmd, path2, "cached"))
@@ -1323,8 +1345,8 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         // forces update of entire UI, used when resuming the activity
         val paused = player.paused ?: return
         updatePlaybackStatus(paused)
-        updatePlaybackPos(psc.position_s)
-        updatePlaybackDuration(psc.duration_s)
+        updatePlaybackPos(psc.positionSec)
+        updatePlaybackDuration(psc.durationSec)
         updateAudioUI()
         if (useAudioUI || showMediaTitle)
             updateMetadataDisplay()
@@ -1403,7 +1425,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
     fun updatePlaybackPos(position: Int) {
         binding.playbackPositionTxt.text = Utils.prettyTime(position)
         if (!userIsOperatingSeekbar)
-            binding.playbackSeekbar.progress = position
+            binding.playbackSeekbar.progress = position * SEEK_BAR_PRECISION
 
         updateDecoderButton()
         updateSpeedButton()
@@ -1413,7 +1435,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
     private fun updatePlaybackDuration(duration: Int) {
         binding.playbackDurationTxt.text = Utils.prettyTime(duration)
         if (!userIsOperatingSeekbar)
-            binding.playbackSeekbar.max = duration
+            binding.playbackSeekbar.max = duration * SEEK_BAR_PRECISION
     }
 
     private fun updatePlaybackStatus(paused: Boolean) {
@@ -1473,7 +1495,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         if (initial || player.vid == -1)
             return
 
-        val ratio = player.videoAspect?.toFloat() ?: 0f
+        val ratio = player.getVideoAspect()?.toFloat() ?: 0f
         Log.v(TAG, "auto rotation: aspect ratio = $ratio")
 
         if (ratio == 0f || ratio in (1f / ASPECT_RATIO_MIN) .. ASPECT_RATIO_MIN) {
@@ -1506,7 +1528,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         }
 
         val params = with(PictureInPictureParams.Builder()) {
-            val aspect = player.videoAspect ?: 1.0
+            val aspect = player.getVideoAspect() ?: 1.0
             setAspectRatio(Rational(aspect.times(10000).toInt(), 10000))
             setActions(listOf(action1))
         }
@@ -1537,7 +1559,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
                 player.paused = false
             }
             override fun onSeekTo(pos: Long) {
-                player.timePos = (pos / 1000).toInt()
+                player.timePos = (pos / 1000.0)
             }
             override fun onSkipToNext() {
                 MPVLib.command(arrayOf("playlist-next"))
@@ -1605,11 +1627,20 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
             updateMetadataDisplay()
     }
 
+    private fun eventPropertyUi(property: String, value: Double) {
+        if (!activityIsForeground) return
+        when (property) {
+            "duration/full" -> updatePlaybackDuration(psc.durationSec)
+            "video-params/aspect", "video-params/rotate" -> {
+                updateOrientation()
+                updatePiPParams()
+            }
+        }
+    }
+
     private fun eventUi(eventId: Int) {
         if (!activityIsForeground) return
-        when (eventId) {
-            MPVLib.mpvEventId.MPV_EVENT_PLAYBACK_RESTART -> updatePlaybackStatus(player.paused!!)
-        }
+
     }
 
     override fun eventProperty(property: String) {
@@ -1657,14 +1688,22 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         eventUiHandler.post { eventPropertyUi(property, value, triggerMetaUpdate) }
     }
 
+    override fun eventProperty(property: String, value: Double) {
+        if (psc.update(property, value))
+            updateMediaSession()
+
+        if (!activityIsForeground) return
+        eventUiHandler.post { eventPropertyUi(property, value) }
+    }
+
     override fun event(eventId: Int) {
-        if (eventId == MPVLib.mpvEventId.MPV_EVENT_SHUTDOWN){
+        if (eventId == MPVLib.MpvEvent.MPV_EVENT_SHUTDOWN) {
             Log.d(TAG, "mpv shutdown")
             finishWithResult(if (playbackHasStarted) Activity.RESULT_OK else Activity.RESULT_CANCELED)
         }
 
 
-        if (eventId == MPVLib.mpvEventId.MPV_EVENT_START_FILE) {
+        if (eventId == MPVLib.MpvEvent.MPV_EVENT_START_FILE) {
             for (c in onloadCommands)
                 MPVLib.command(c)
             if (this.statsLuaMode > 0 && !playbackHasStarted) {
@@ -1681,7 +1720,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
 
     // Gesture handler
 
-    private var initialSeek = 0
+    private var initialSeek = 0f
     private var initialBright = 0f
     private var initialVolume = 0
     private var maxVolume = 0
@@ -1701,7 +1740,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
             PropertyChange.Init -> {
                 mightWantToToggleControls = false
 
-                initialSeek = psc.position_s
+                initialSeek = (psc.position / 1000f)
                 initialBright = Utils.getScreenBrightness(requireActivity()) ?: 0.5f
                 with (audioManager!!) {
                     initialVolume = getStreamVolume(AudioManager.STREAM_MUSIC)
@@ -1718,8 +1757,8 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
             }
             PropertyChange.Seek -> {
                 // disable seeking when duration is unknown
-                val duration = psc.duration_s
-                if (duration == 0 || initialSeek < 0)
+                val duration = (psc.duration / 1000f)
+                if (duration == 0f || initialSeek < 0)
                     return
                 if (smoothSeekGesture && pausedForSeek == 0) {
                     pausedForSeek = if (psc.pause) 2 else 1
@@ -1727,20 +1766,21 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
                         player.paused = true
                 }
 
-                val newPos = (initialSeek + diff.toInt()).coerceIn(0, duration)
-                val newDiff = newPos - initialSeek
+                val newPosExact = (initialSeek + diff).coerceIn(0f, duration)
+                val newPos = newPosExact.roundToInt()
+                val newDiff = (newPosExact - initialSeek).roundToInt()
                 if (smoothSeekGesture) {
-                    player.timePos = newPos // (exact seek)
+                    player.timePos = newPosExact.toDouble() // (exact seek)
                 } else {
                     // seek faster than assigning to timePos but less precise
-                    MPVLib.command(arrayOf("seek", newPos.toString(), "absolute+keyframes"))
+                    MPVLib.command(arrayOf("seek", "$newPosExact", "absolute+keyframes"))
                 }
-                updatePlaybackPos(newPos)
+                // Note: don't call updatePlaybackPos() here because mpv will seek a timestamp
+                // actually present in the file, and not the exact one we specified.
 
+                val posText = Utils.prettyTime(newPos)
                 val diffText = Utils.prettyTime(newDiff, true)
-                gestureTextView.text = getString(
-                    R.string.ui_seek_distance,
-                    Utils.prettyTime(newPos), diffText)
+                gestureTextView.text = getString(R.string.ui_seek_distance, posText, diffText)
             }
             PropertyChange.Volume -> {
                 if (maxVolume == 0)
@@ -1768,7 +1808,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
             /* Tap gestures */
             PropertyChange.SeekFixed -> {
                 val seekTime = diff * 10f
-                val newPos = psc.position_s + seekTime.toInt() // only for display
+                val newPos = psc.positionSec + seekTime.toInt() // only for display
                 MPVLib.command(arrayOf("seek", seekTime.toString(), "relative"))
 
                 val diffText = Utils.prettyTime(seekTime.toInt(), true)
@@ -1809,6 +1849,7 @@ class MPVFragment : Fragment(R.layout.player), MPVLib.EventObserver, TouchGestur
         private const val RCODE_LOAD_FILE = 1002
         // action of result intent
         private const val RESULT_INTENT = "is.xyz.mpv.MPVActivity.result"
+        private const val SEEK_BAR_PRECISION = 2
 
         @JvmStatic
         fun getInstance(url: String?): MPVFragment {
