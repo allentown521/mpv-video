@@ -79,6 +79,9 @@ internal class MPVView(context: Context, attrs: AttributeSet) : BaseMPVView(cont
                 MPVLib.setOptionString(mpvOption, preference)
         }
 
+        // 文件循环播放,否则播放完成会自动关掉播放器
+        MPVLib.setOptionString("loop-file", "inf")
+
         val debandMode = sharedPreferences.getString("video_debanding", "")
         if (debandMode == "gradfun") {
             // lower the default radius (16) to improve performance
